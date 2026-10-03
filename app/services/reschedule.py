@@ -111,6 +111,10 @@ def review_and_reschedule(
         "draft": draft,
         "height": height,
         "margin": margin,
+        # 档案引用仅作历史溯源；复核/改期一律使用上方快照固化参数，
+        # 不回读档案当前版本（档案后续变更不改写历史）
+        "ship_number": snap["ship_number"],
+        "ship_version": snap["ship_version"],
         "original_arrival_minute": snap["arrival_minute"],
         "safe": safe,
         "first_violation": violation,

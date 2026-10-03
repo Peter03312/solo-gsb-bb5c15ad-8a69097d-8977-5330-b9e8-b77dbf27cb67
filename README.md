@@ -28,7 +28,19 @@
 求**改期行程**（变动航段最少 → 抵达最早 → 出发分钟序列字典序），窗口内无解则只返回
 风险与无解标记，**绝不修改已确认快照**。
 
-**本轮新增同修订批次**：调度员可把**同一潮位修订**下按优先顺序排列的 **2～5 艘船**
+**本轮新增船舶档案**：调度员按**唯一船号**管理船舶档案——非负吃水、水面以上
+高度、安全余量及启停状态，建档为版本 1，**有效变更递增版本**，当前与历史版本
+均可查（`POST /api/ships`、`POST /api/ships/{船号}/versions`、`GET /api/ships*`）。
+单船与同修订批次的**预排可用船号代替三项参数**，按**当前启用版本**规划，响应
+回传船号与版本；直接提交三项参数的既有请求、响应与择优规则**保持兼容**
+（响应仅新增可空字段 `ship_number`/`ship_version`），**两种输入混用一律拒绝**
+（`MIXED_SHIP_INPUT`）。档案行程确认须**回填规划所得船号、版本及行程**，在
+**原事务**内核对档案仍启用且版本未变，再按现有潮位、航时管制与占用复算；失效
+（档案已变更/停用）即拒绝且不保存，批次全退。确认**快照固化所用参数与档案引用**，
+潮位复核与改期建议**只用快照参数**；后续档案变更不改写历史，作废与批次同键
+重放沿用旧语义。未知/重复船号、非法参数均明确拒绝且不留半成品。
+
+**上一轮新增同修订批次**：调度员可把**同一潮位修订**下按优先顺序排列的 **2～5 艘船**
 作为一个批次**预排**（`POST /api/trips/batch/plan`，只读不占位）——逐艘沿用单船
 最早抵达 + 同刻航段序列字典序择优，后船同时避开**全部已确认占用**与**本批前船的拟
 占用**，任一船无解即返回首个失败序号；随后用**批次幂等键**一次性**确认整批**
@@ -94,6 +106,7 @@ docker compose up --build -d
    - 航段 `1:A→B(30min,深6m)`、`2:B→C(40min,深4m,净空8m)`、`3:C→D(20min,深5m)`、`4:B→D(90min,深3.5m)`
    - 潮位修订 `#1`：分钟 `0..1439`，名义潮位 `2.0 + 1.5·sin(2π·m/720)`（米），
      预测误差 0（可随后经 `/api/tide/error-revisions` 登记逐分钟误差）
+   - 演示船舶档案 `DEMO-001`（版本 1、启用；吃水 5m / 水面以上 8m / 安全余量 0.5m）
 
 查看日志 / 停止：
 
@@ -134,13 +147,62 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `DB_PATH` | `/data/tide.db` | SQLite 数据库文件路径，所在目录自动创建 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `8000` | 监听端口 |
-| `SEED_DEMO` | `true` | 空库启动时是否写入演示节点/航段/初始潮位修订 |
+| `SEED_DEMO` | `true` | 空库启动时是否写入演示节点/航段/初始潮位修订/演示船舶档案 |
 | `MAX_WINDOW` | `1440` | 规划窗口上限（分钟） |
 
 ---
 
 ## 2. 领域规则
 
+- **船舶档案（按唯一船号版本化管理，本轮新增）**：调度员按唯一船号管理船舶
+  档案，每版包含**非负**吃水 `draft`、**非负**水面以上高度 `height`、**非负**
+  安全余量 `margin` 与**启停状态** `active`。
+  - **建档**（`POST /api/ships`）：唯一船号 + 四项内容产生**版本 1**；重复船号
+    `409 SHIP_ALREADY_EXISTS`，船号为空白 `422 VALIDATION_ERROR`，任一参数为负
+    同属 `422 VALIDATION_ERROR`，均不留半成品。
+  - **有效变更递增版本**（`POST /api/ships/{船号}/versions`）：仅当三项参数与
+    启停状态至少一项相对当前版本变化时才写入新版本（版本号自 1 起严格递增，
+    当前版本 = 最大版本号）；与当前版本完全相同 ->
+    `422 SHIP_VERSION_UNCHANGED`，不产生新版本。**停用以 `active=false` 的
+    新版本登记**（状态切换本身即有效变更），再启用同样产生新版本；未知船号
+    `404 SHIP_NOT_FOUND`。
+  - **当前与历史版本可查**：`GET /api/ships`（全部档案当前版本摘要，按船号
+    排序）、`GET /api/ships/{船号}`（当前版本 + 全部历史版本，未知船号
+    `404 SHIP_NOT_FOUND`）、`GET /api/ships/{船号}/versions`（版本号升序，
+    当前版本 `is_current=true`）、`GET /api/ships/{船号}/versions/{v}`
+    （未知版本 `404 SHIP_VERSION_NOT_FOUND`）。
+  - **预排可用船号代替三项参数**：单船 `/api/trips/plan` 与批次
+    `/api/trips/batch/plan` 的每艘船均可**只给船号**，服务按该船**当前启用
+    版本**回填三项参数；预排响应回传 `ship_number` 与 `ship_version`
+    （参数模式二者为 `null`）。未知船号 `404 SHIP_NOT_FOUND`；当前停用
+    `409 SHIP_INACTIVE`。
+  - **两种输入禁止混用**：同一请求（批次中为同一艘船）要么只给船号，要么
+    给齐三项参数。船号与任一参数同现、确认时只给版本号不给船号 ->
+    `422 MIXED_SHIP_INPUT`；参数模式三项给不全 ->
+    `422 SHIP_PARAMETERS_INCOMPLETE`（`details.missing` 列出缺失字段）；
+    两者都不给同此码。批次内逐船二选一，不同船可分别使用不同模式；单船
+    层面的拒绝在批次中带 `details.ship_index`（首个失败序号，0 起）。
+  - **确认在原事务核对档案**：档案模式确认（单船与批次确认）必须回填
+    `ship_number` 与预排所得 `ship_version`。服务在**原确认事务**
+    （`BEGIN IMMEDIATE`）内、复算潮位/航时管制/占用**之前**核对：该船仍
+    存在（`404 SHIP_NOT_FOUND`）、该版本仍是**当前版本**
+    （已推进 -> `409 SHIP_VERSION_STALE`，`details` 给 provided/current
+    版本号）且该版本处于**启用**状态（`409 SHIP_INACTIVE`）；缺
+    `ship_version` -> `422 SHIP_VERSION_REQUIRED`，版本号不存在 ->
+    `404 SHIP_VERSION_NOT_FOUND`。任一失效即拒绝且不保存，批次内任一船失效
+    **整批回滚**（带 `details.ship_index`）。
+  - **快照固化参数与档案引用**：确认成功后三项参数与档案引用（船号、版本号）
+    一并固化进 `confirmed_trips`（可空列；直接提交参数的旧请求为 `null`，
+    旧版数据库启动时自动补列）。之后**潮位复核与改期建议只用快照参数**
+    （`review` 响应同时回带 `ship_number`/`ship_version` 仅供溯源）；**档案
+    后续变更（含停用）不改写任何历史快照**；已确认快照的占用、作废与批次
+    同键重放语义**完全不变**——档案升版/停用后用批次原幂等键 + 原内容重放，
+    仍返回 `200 replayed:true` 与首次的行程号及首次固化的船号/版本号引用，
+    不复算、不新增快照、不重新产生占用。
+  - **直接提交参数的既有请求、响应与择优规则保持兼容**：旧请求体（三项参数
+    给齐、不带船号）行为不变；响应仅**新增可空字段**
+    （`ship_number`/`ship_version`，参数模式为 `null`），最早抵达 + 同刻航段
+    编号序列字典序择优规则不变。
 - **节点**：港口位置点。**航段为单向**，航时必须为**正整数**分钟；可设桥底净空（不设表示无桥）。
 - **时间轴**：绝对"分钟"（非负整数），与潮位表的 `minute` 对齐。规划窗口为
   `[start_minute, start_minute + window_minutes)`，长度 ≤ 1440。
@@ -332,6 +394,17 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 场景 | HTTP | code |
 | --- | --- | --- |
+| 建档船号重复 | 409 | `SHIP_ALREADY_EXISTS` |
+| 船号为空白字符串 | 422 | `VALIDATION_ERROR` |
+| 档案三项参数为负 / 新版本参数为负 | 422 | `VALIDATION_ERROR` |
+| 查询/变更引用未知船号（预排/确认/版本接口） | 404 | `SHIP_NOT_FOUND` |
+| 查询未知档案版本号 | 404 | `SHIP_VERSION_NOT_FOUND` |
+| 新版本内容与当前版本完全相同（含启停） | 422 | `SHIP_VERSION_UNCHANGED`（不产生新版本） |
+| 预排/确认引用的档案当前已停用 | 409 | `SHIP_INACTIVE` |
+| 船号与三项参数混用（含确认只给版本号不给船号） | 422 | `MIXED_SHIP_INPUT` |
+| 参数模式三项参数给不全（含两者都不给） | 422 | `SHIP_PARAMETERS_INCOMPLETE`（`details.missing`） |
+| 档案模式确认缺 `ship_version` | 422 | `SHIP_VERSION_REQUIRED` |
+| 确认时档案版本已推进（预排后发生过有效变更） | 409 | `SHIP_VERSION_STALE`（不保存；批次带 `ship_index`、全批回滚） |
 | 起点或终点未知 | 404 | `NODE_NOT_FOUND` |
 | 指定潮位修订不存在 / 复核时目标修订未知 / 误差修订的基础修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
 | 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
@@ -340,8 +413,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 参数校验失败（窗口>1440、航时非正、误差为负、分钟为负等） | 422 | `VALIDATION_ERROR` |
 | 确认时修订已过期（单船与批次一致） | 409 | `REVISION_STALE` |
 | 确认时行程复核不一致（潮位重算结果不同，或占用变化使提交行程不再最优/已无可行解） | 409 | `PLAN_MISMATCH` |
-| 批次预排中任一船失败（未知节点/缺潮位/无可行行程） | 同既有码 | 既有码，`details.ship_index` 给出首个失败序号（0 起） |
+| 批次预排中任一船失败（未知节点/缺潮位/无可行行程/未知船号/停用/混用/参数不全） | 同既有码 | 既有码，`details.ship_index` 给出首个失败序号（0 起） |
 | 批次确认中任一船无解或与复算不一致 | 409 | `PLAN_MISMATCH`（`details.ship_index`/`reason`，全批不保存） |
+| 批次确认中任一船档案失效（版本推进/停用/未知船号/版本/混用/缺版本号） | 409/404/422 | 对应档案错误码，`details.ship_index` 指船，全批回滚 |
 | 同批次幂等键提交了不同内容（或不同修订号） | 409 | `BATCH_KEY_CONFLICT`（不保存） |
 | 批次船数不在 2～5、幂等键缺失/过长、字段非法 | 422 | `VALIDATION_ERROR` |
 | 分时管制航段未知（替换/查询） | 404 | `SEGMENT_NOT_FOUND` |
@@ -360,7 +434,34 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
-> **本轮用法（误确认行程作废）**：新增两个端点，旧 API 路径与请求/响应
+> **本轮用法（船舶档案 + 船号预排/确认）**：新增 6 个档案端点；预排/确认的
+> 请求与响应**向后兼容**（三项参数改可选；响应仅新增可空的
+> `ship_number` / `ship_version`，参数模式为 `null`），旧版数据库启动自动
+> 补列、历史快照引用列为 `null`——
+> - `POST /api/ships`：按唯一船号建档（版本 1，含非负三项参数与启停状态）；
+>   重复船号 `409 SHIP_ALREADY_EXISTS`、参数为负 `422 VALIDATION_ERROR`；
+> - `POST /api/ships/{船号}/versions`：登记有效变更并递增版本（停用 =
+>   `active:false` 的新版本；无变化 `422 SHIP_VERSION_UNCHANGED`）；
+> - `GET /api/ships` / `GET /api/ships/{船号}` /
+>   `GET /api/ships/{船号}/versions` /
+>   `GET /api/ships/{船号}/versions/{v}`：当前版本摘要、档案详情（含全部版本）、
+>   版本列表、指定版本；
+> - `POST /api/trips/plan` 与 `POST /api/trips/batch/plan`：每艘船可只给
+>   `ship_number`，按**当前启用版本**规划，响应回传船号与版本号；未知船号
+>   `404 SHIP_NOT_FOUND`、停用 `409 SHIP_INACTIVE`；船号与三项参数混用
+>   `422 MIXED_SHIP_INPUT`、参数给不全 `422 SHIP_PARAMETERS_INCOMPLETE`；
+> - `POST /api/trips/confirm` 与 `POST /api/trips/batch/confirm`：档案模式
+>   回填 `ship_number` + `ship_version`，在**原确认事务**内核对档案仍启用且
+>   版本未变，再按潮位/航时管制/占用复算；版本推进 `409 SHIP_VERSION_STALE`、
+>   停用 `409 SHIP_INACTIVE`、缺版本号 `422 SHIP_VERSION_REQUIRED`，失败不保存
+>   （批次 `details.ship_index` 指船、全批回滚）；
+> - 确认快照**固化三项参数与档案引用**；`review` 潮位复核/改期只用快照参数，
+>   档案后续变更不改写历史；作废与批次同键重放沿用旧语义（重放返回首次固化
+>   的船号/版本引用，不复算）；
+> - 启动方式不变（`docker compose up` / `docker run` / `uvicorn app.main:app`），
+>   空库演示数据新增一艘启用档案 `DEMO-001`（吃水 5m / 水面以上 8m / 余量 0.5m）。
+>
+> **上一轮用法（误确认行程作废）**：新增两个端点，旧 API 路径与请求/响应
 > 结构完全兼容（`TripOut` 仅新增可空字段 `voided_at`）——
 > - `POST /api/trips/{trip_id}/void`：请求体 `{"reason": "非空原因"}`，
 >   首次作废 `201`，返回 `{trip_id, reason, voided_at, replayed:false}`；
@@ -426,6 +527,12 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| POST | `/api/ships` | **本轮新增**：按唯一船号建档（版本 1；非负三项参数 + 启停状态），重复船号 `SHIP_ALREADY_EXISTS` |
+| GET | `/api/ships` | **本轮新增**：船舶档案列表（按船号排序，当前版本摘要） |
+| GET | `/api/ships/{ship_number}` | **本轮新增**：档案详情（当前版本 + 全部历史版本） |
+| GET | `/api/ships/{ship_number}/versions` | **本轮新增**：档案全部版本（当前版本 `is_current=true`） |
+| GET | `/api/ships/{ship_number}/versions/{version}` | **本轮新增**：读取指定档案版本（未知版本 `SHIP_VERSION_NOT_FOUND`） |
+| POST | `/api/ships/{ship_number}/versions` | **本轮新增**：有效变更递增版本（含启停切换）；无变化 `SHIP_VERSION_UNCHANGED` |
 | POST | `/api/nodes` | 录入节点 |
 | GET | `/api/nodes` | 节点列表 |
 | POST | `/api/segments` | 录入单向航段 |
@@ -439,10 +546,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
 | POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
 | POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订 |
-| POST | `/api/trips/plan` | 规划最早抵达行程 |
-| POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核） |
-| POST | `/api/trips/batch/plan` | **本轮新增**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用） |
-| POST | `/api/trips/batch/confirm` | **本轮新增**：携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放） |
+| POST | `/api/trips/plan` | 规划最早抵达行程（三项参数或 `ship_number` 二选一；档案模式回带船号/版本） |
+| POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核；档案模式事务内核验启用+版本未变并固化引用） |
+| POST | `/api/trips/batch/plan` | 同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用；每艘船可用船号） |
+| POST | `/api/trips/batch/confirm` | 携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放；档案失效整批回滚） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
 | POST | `/api/trips/{trip_id}/void` | **本轮新增**：凭非空原因作废误确认行程（重复作废 200 返回首次记录） |
 | GET | `/api/trips/{trip_id}/void` | **本轮新增**：按行程号查询作废记录（未作废 `VOID_RECORD_NOT_FOUND`） |
@@ -621,6 +728,101 @@ POST /api/trips/7/void
   占用立即对后续规划/确认/改期失效（狭窄水道组的整组展开同步失效）。
 - 作废原因为空串或纯空白 -> `422 VALIDATION_ERROR`（首尾空白会被剥离，
   `"  原因  "` 以 `原因` 入库）。
+
+### 船舶档案建档 / 版本 / 查询请求与响应示例（本轮新增）
+
+建档（船号唯一，成功返回版本 1 与完整档案）：
+
+```json
+POST /api/ships
+{
+  "ship_number": "HAIYANG-007",
+  "draft": 5.0,
+  "height": 8.0,
+  "margin": 0.5,
+  "active": true,
+  "note": "海洋 007 轮"
+}
+```
+
+```json
+{
+  "ship_number": "HAIYANG-007",
+  "created_at": "2026-10-03 08:00:00",
+  "current_version": 1,
+  "active": true,
+  "draft": 5.0,
+  "height": 8.0,
+  "margin": 0.5,
+  "note": "海洋 007 轮",
+  "versions": [
+    {"ship_number": "HAIYANG-007", "version": 1, "draft": 5.0, "height": 8.0,
+     "margin": 0.5, "active": true, "note": "海洋 007 轮",
+     "created_at": "2026-10-03 08:00:00", "is_current": true}
+  ]
+}
+```
+
+登记有效变更（至少一项不同；停用可只把 `active` 置为 `false`）：
+
+```json
+POST /api/ships/HAIYANG-007/versions
+{"draft": 5.4, "height": 8.0, "margin": 0.5, "active": true, "note": "吃水修正"}
+```
+
+```json
+{"ship_number": "HAIYANG-007", "version": 2, "draft": 5.4, "height": 8.0,
+ "margin": 0.5, "active": true, "note": "吃水修正",
+ "created_at": "2026-10-03 09:00:00", "is_current": true}
+```
+
+- 三项参数与启停与当前版本完全相同 -> `422 SHIP_VERSION_UNCHANGED`；
+- `GET /api/ships` 返回全部档案的当前版本摘要（无 `versions`）；
+  `GET /api/ships/HAIYANG-007` 返回当前版本 + 全部历史版本；
+  `GET /api/ships/HAIYANG-007/versions` 只返回版本数组；
+  `GET /api/ships/HAIYANG-007/versions/1` 返回指定版本。
+
+### 船号预排 / 确认请求与响应示例（本轮新增）
+
+预排只给船号（三项参数由档案当前启用版本回填），响应回带所用船号与版本：
+
+```json
+POST /api/trips/plan
+{"origin": "A", "destination": "D", "start_minute": 0,
+ "window_minutes": 1440, "ship_number": "HAIYANG-007"}
+```
+
+```json
+{
+  "revision": 1, "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 1440,
+  "draft": 5.4, "height": 8.0, "margin": 0.5,
+  "ship_number": "HAIYANG-007", "ship_version": 2,
+  "arrival_minute": 90, "total_wait_minutes": 0,
+  "itinerary": [ /* …与既有响应完全同构… */ ]
+}
+```
+
+确认时把预排所得船号、版本与行程原样回填（**不要**再带三项参数）：
+
+```json
+POST /api/trips/confirm
+{
+  "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 1440,
+  "ship_number": "HAIYANG-007", "ship_version": 2,
+  "revision": 1,
+  "itinerary": [ /* 预排响应原样回填 */ ]
+}
+```
+
+成功 `201` 的快照响应含固化的 `draft/height/margin` 与
+`ship_number/ship_version`。预排后档案若登记过新版本，用旧 `ship_version`
+确认 -> `409 SHIP_VERSION_STALE`（需按当前版本重新预排）；档案停用 ->
+`409 SHIP_INACTIVE`；船号与三项参数同时出现 -> `422 MIXED_SHIP_INPUT`。
+`GET /api/trips`、`GET /api/trips/{id}` 与 `POST /api/trips/{id}/review`
+的响应同样携带固化的 `ship_number/ship_version`（参数模式与历史快照为
+`null`）；复核/改期始终只用快照里的三项参数，不回读档案。
 
 ### 规划请求 / 响应示例
 
@@ -850,7 +1052,64 @@ curl -s $BASE/health
 # 查看演示航段
 curl -s $BASE/api/segments
 
-# 0) 本轮新增：误确认后作废行程（行程号 + 非空原因；重复作废返回首次记录）
+# ---------------------------------------------------------------------------
+# -1) 本轮新增：船舶档案 + 船号预排/确认
+# ---------------------------------------------------------------------------
+
+# 建档（唯一船号；非负吃水/水面以上高度/安全余量 + 启停状态，产生版本 1）
+curl -s -X POST $BASE/api/ships -H 'Content-Type: application/json' -d '{
+  "ship_number":"HAIYANG-007","draft":5.0,"height":8.0,"margin":0.5,
+  "active":true,"note":"海洋007轮"}'
+# 重复船号 -> 409 SHIP_ALREADY_EXISTS；参数为负/船号空白 -> 422 VALIDATION_ERROR
+
+# 查询：列表（当前版本摘要）/ 详情（含全部版本）/ 版本清单 / 指定版本
+curl -s $BASE/api/ships
+curl -s $BASE/api/ships/HAIYANG-007
+curl -s $BASE/api/ships/HAIYANG-007/versions
+curl -s $BASE/api/ships/HAIYANG-007/versions/1   # 未知版本 -> 404 SHIP_VERSION_NOT_FOUND
+
+# 有效变更递增版本（至少一项变化；停用就发 active=false 的新版本）
+curl -s -X POST $BASE/api/ships/HAIYANG-007/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"draft":5.4,"height":8.0,"margin":0.5,"active":true,"note":"吃水修正"}'
+# 与当前版本完全相同 -> 422 SHIP_VERSION_UNCHANGED（不产生新版本）
+
+# 预排：只给船号，按当前启用版本回填三项参数，响应回带 ship_number/ship_version
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+  "ship_number":"HAIYANG-007"}'
+# 未知船号 -> 404 SHIP_NOT_FOUND；当前停用 -> 409 SHIP_INACTIVE
+# 船号与 draft/height/margin 同现 -> 422 MIXED_SHIP_INPUT
+# 参数给不全（含都不给）-> 422 SHIP_PARAMETERS_INCOMPLETE
+# 直接给齐三项参数的旧请求保持可用，响应 ship_number/ship_version 为 null
+
+# 确认：把预排所得船号 + 版本号 + 修订号 + 行程原样回填（不要再带三项参数）
+curl -s -X POST $BASE/api/trips/confirm -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+  "ship_number":"HAIYANG-007","ship_version":2,"revision":1,
+  "itinerary":[{"seg_id":1,"origin":"A","destination":"B",
+                "start_minute":0,"end_minute":30,"travel_time":30}]}'
+# 预排后档案升过版本 -> 409 SHIP_VERSION_STALE（重新预排后再确认）
+# 档案停用 -> 409 SHIP_INACTIVE；缺 ship_version -> 422 SHIP_VERSION_REQUIRED
+
+# 快照固化参数与档案引用：之后档案再改/停用，历史快照与复核都不变
+curl -s $BASE/api/trips            # ship_number/ship_version 为固化引用
+curl -s -X POST $BASE/api/trips/1/review   # 复核/改期只用快照参数，不回读档案
+
+# 批次：每艘船同样可以只给 ship_number（逐船二选一，不同船可混用两种模式）
+curl -s -X POST $BASE/api/trips/batch/plan -H 'Content-Type: application/json' -d '{
+  "ships":[
+    {"origin":"A","destination":"B","start_minute":0,"window_minutes":1440,
+     "ship_number":"HAIYANG-007"},
+    {"origin":"A","destination":"B","start_minute":0,"window_minutes":1440,
+     "draft":6.0,"height":8.0,"margin":0.5}]}'
+# 批次确认回填各船 ship_number+ship_version；任一船档案失效 ->
+# 对应错误码 + details.ship_index，整批回滚；同键重放仍返回首次固化引用
+
+# 空库启动时自带演示档案 DEMO-001（吃水 5m / 水面以上 8m / 余量 0.5m，启用）
+curl -s $BASE/api/ships/DEMO-001
+
+# 0) 上一轮新增：误确认后作废行程（行程号 + 非空原因；重复作废返回首次记录）
 curl -s -X POST $BASE/api/trips/$TID/void \
   -H 'Content-Type: application/json' \
   -d '{"reason":"调度员误确认：船舶未离泊，撤销占用"}'
@@ -1311,12 +1570,13 @@ app/
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/controls.py  # 航段分时航时管制：区间校验、整组替换、按进入分钟取实际航时
   services/groups.py    # 狭窄水道组：登记（单事务、不留半成品）、组关系读取与整组占用展开
+  services/ships.py     # 船舶档案：建档/有效变更递增版本/启停/当前与历史版本查询；预排与确认的船号/参数输入解析与事务内核验
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
   services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
   services/voids.py     # 误确认作废：事务内作废（重复作废返回首次记录）、作废记录查询
-  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/潮位更正与误差修订/单船与批次规划确认/复核改期/作废）
-tests/                  # pytest 测试（137 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行等）
+  main.py               # FastAPI 路由（船舶档案/节点/航段/分时管制/狭窄水道组/潮位更正与误差修订/单船与批次规划确认/复核改期/作废）
+tests/                  # pytest 测试（185 个，含船舶档案版本化、船号预排/确认/批次回滚/快照固化，及择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行等）
 Dockerfile
 docker-compose.yml
 requirements.txt

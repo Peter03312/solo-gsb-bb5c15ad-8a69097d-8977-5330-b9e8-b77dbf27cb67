@@ -51,7 +51,34 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     margin          REAL NOT NULL,
     arrival_minute  INTEGER NOT NULL,
     itinerary       TEXT NOT NULL,                          -- JSON 快照
+    -- 档案引用：凭船号预排/确认时固化所用船号与版本；直接提交参数的旧请求为 NULL。
+    -- 只作历史引用，不建外键级联：档案后续变更/停用均不改写历史快照。
+    ship_number     TEXT,
+    ship_version    INTEGER,
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 船舶档案主表：调度员按唯一船号建档。三项参数与启停状态全部落在
+-- ship_versions 版本表中，主表只保存船号与建档时间。
+CREATE TABLE IF NOT EXISTS ships (
+    ship_number TEXT PRIMARY KEY,                           -- 唯一船号（非空字符串）
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 船舶档案版本：有效变更递增版本号（自 1 起）；仅在吃水/水面以上高度/
+-- 安全余量/启停状态至少一项相对当前版本变化时才允许新增（无变化拒绝，
+-- 不产生无意义版本）。当前版本 = 最大版本号；active=0 表示该船当前停用，
+-- 预排/确认一律拒绝（历史已确认快照不受影响）。
+CREATE TABLE IF NOT EXISTS ship_versions (
+    ship_number TEXT NOT NULL REFERENCES ships(ship_number),
+    version     INTEGER NOT NULL,                           -- 版本号，自 1 递增
+    draft       REAL NOT NULL CHECK (draft >= 0),           -- 吃水（米，非负）
+    height      REAL NOT NULL CHECK (height >= 0),          -- 水面以上高度（米，非负）
+    margin      REAL NOT NULL CHECK (margin >= 0),          -- 安全余量（米，非负）
+    active      INTEGER NOT NULL DEFAULT 1,                 -- 1=启用 0=停用
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (ship_number, version)
 );
 
 CREATE TABLE IF NOT EXISTS batch_confirmations (
@@ -129,10 +156,19 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）。"""
+    """旧版数据库平滑升级。"""
+    # 为 tide_values 补 error 列（既有行误差取 0）
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     if "error" not in cols:
         conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
+    # 为 confirmed_trips 补档案引用列（旧快照为 NULL）
+    trip_cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()
+    }
+    if "ship_number" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_number TEXT")
+    if "ship_version" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +210,17 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
         rows = [(rev, m, 2.0 + 1.5 * math.sin(2 * math.pi * m / 720.0)) for m in range(1440)]
         conn.executemany(
             "INSERT INTO tide_values(revision, minute, level) VALUES (?, ?, ?)", rows
+        )
+
+        # 一艘演示船舶档案（版本 1，启用）：可用船号代替三项参数预排
+        conn.execute(
+            "INSERT INTO ships(ship_number) VALUES (?)", ("DEMO-001",)
+        )
+        conn.execute(
+            "INSERT INTO ship_versions"
+            " (ship_number, version, draft, height, margin, active, note)"
+            " VALUES (?, 1, ?, ?, ?, 1, ?)",
+            ("DEMO-001", 5.0, 8.0, 0.5, "演示船舶：吃水 5m / 水面以上 8m / 余量 0.5m"),
         )
         conn.execute("COMMIT")
     except Exception:

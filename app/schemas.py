@@ -124,16 +124,91 @@ class RevisionOut(BaseModel):
     created_at: str
 
 
+# ---- 船舶档案 ----------------------------------------------------------------------
+
+class ShipCreateRequest(BaseModel):
+    ship_number: str = Field(
+        min_length=1,
+        description="唯一船号（非空字符串，建议如 IMO 号或调度编号）；建档即版本 1",
+    )
+    draft: float = Field(ge=0, description="船舶吃水（米，非负）")
+    height: float = Field(ge=0, description="水面以上高度（米，非负）")
+    margin: float = Field(ge=0, description="安全余量（米，非负）")
+    active: bool = Field(default=True, description="启停状态：true=启用，false=停用")
+    note: Optional[str] = None
+
+
+class ShipVersionRequest(BaseModel):
+    draft: float = Field(ge=0, description="船舶吃水（米，非负）")
+    height: float = Field(ge=0, description="水面以上高度（米，非负）")
+    margin: float = Field(ge=0, description="安全余量（米，非负）")
+    active: bool = Field(description="启停状态：true=启用，false=停用；状态切换也是有效变更")
+    note: Optional[str] = None
+
+
+class ShipVersionOut(BaseModel):
+    ship_number: str
+    version: int = Field(description="版本号，自 1 递增；当前版本 = 最大版本号")
+    draft: float
+    height: float
+    margin: float
+    active: bool
+    note: Optional[str] = None
+    created_at: str
+    is_current: bool = Field(description="是否为当前（最新）版本")
+
+
+class ShipOut(BaseModel):
+    ship_number: str
+    created_at: str
+    current_version: int = Field(description="当前版本号")
+    active: bool = Field(description="当前版本的启停状态")
+    draft: float
+    height: float
+    margin: float
+    note: Optional[str] = Field(default=None, description="当前版本备注")
+    versions: list[ShipVersionOut] = Field(
+        description="全部历史版本（按版本号升序），当前版本 is_current=true"
+    )
+
+
+class ShipSummaryOut(BaseModel):
+    ship_number: str
+    created_at: str
+    current_version: int
+    active: bool
+    draft: float
+    height: float
+    margin: float
+    note: Optional[str] = None
+
+
 # ---- 规划 / 确认 ----------------------------------------------------------------
 
 class PlanRequest(BaseModel):
+    """单船预排请求。两种输入二选一，禁止混用：
+
+    * 档案模式：仅给 ``ship_number``，按该船**当前启用版本**的三项参数规划；
+    * 参数模式（既有、保持兼容）：显式给齐 ``draft`` / ``height`` / ``margin``。
+    """
     origin: str
     destination: str
     start_minute: int = Field(ge=0, description="规划窗口起点（绝对分钟，>=0）")
     window_minutes: int = Field(gt=0, le=config.MAX_WINDOW, description="窗口长度，<=1440")
-    draft: float = Field(ge=0, description="船舶吃水（米）")
-    height: float = Field(ge=0, description="水面以上高度（米）")
-    margin: float = Field(ge=0, description="安全余量（米）")
+    ship_number: Optional[str] = Field(
+        default=None,
+        description="船号：给定后按该船当前启用版本取三项参数；"
+                    "不得再同时给 draft/height/margin",
+    )
+    draft: Optional[float] = Field(
+        default=None, ge=0, description="船舶吃水（米，非负）；参数模式必填"
+    )
+    height: Optional[float] = Field(
+        default=None, ge=0, description="水面以上高度（米，非负）；参数模式必填"
+    )
+    margin: Optional[float] = Field(
+        default=None, ge=0, description="安全余量（米，非负）；参数模式必填"
+    )
     revision: Optional[int] = Field(default=None, description="潮位修订号；不填用最新")
 
 
@@ -152,29 +227,69 @@ class PlanResponse(BaseModel):
     destination: str
     start_minute: int
     window_minutes: int
-    draft: float
-    height: float
-    margin: float
+    draft: float = Field(description="本次规划实际所用吃水（档案模式取档案版本值）")
+    height: float = Field(description="本次规划实际所用水面以上高度")
+    margin: float = Field(description="本次规划实际所用安全余量")
+    ship_number: Optional[str] = Field(
+        default=None, description="档案模式回传所用船号；参数模式为 null"
+    )
+    ship_version: Optional[int] = Field(
+        default=None, description="档案模式回传当时的当前版本号；参数模式为 null"
+    )
     arrival_minute: int
     total_wait_minutes: int
     itinerary: list[LegOut]
 
 
-class ConfirmRequest(PlanRequest):
+class ConfirmRequest(BaseModel):
+    """单船确认请求。
+
+    参数模式（既有、保持兼容）：显式给齐三项参数，回填 ``itinerary`` 与
+    ``revision``。档案模式：给 ``ship_number`` 与预排响应回传的
+    ``ship_version``，三项参数由档案版本在事务内回填；禁止两种输入混用。
+    """
+    origin: str
+    destination: str
+    start_minute: int = Field(ge=0, description="规划窗口起点（绝对分钟，>=0）")
+    window_minutes: int = Field(gt=0, le=config.MAX_WINDOW, description="窗口长度，<=1440")
+    ship_number: Optional[str] = Field(
+        default=None,
+        description="船号：给定后必须同时给 ship_version，三项参数由档案版本回填；"
+                    "不得再同时给 draft/height/margin",
+    )
+    ship_version: Optional[int] = Field(
+        default=None, ge=1,
+        description="预排响应回传的档案版本号；确认时核验该版本仍为当前版本",
+    )
+    draft: Optional[float] = Field(
+        default=None, ge=0, description="船舶吃水（米，非负）；参数模式必填"
+    )
+    height: Optional[float] = Field(
+        default=None, ge=0, description="水面以上高度（米，非负）；参数模式必填"
+    )
+    margin: Optional[float] = Field(
+        default=None, ge=0, description="安全余量（米，非负）；参数模式必填"
+    )
+    revision: Optional[int] = Field(
+        default=None, description="潮位修订号；确认必填（沿用既有 422 口径）"
+    )
     itinerary: list[LegOut] = Field(description="按规划结果原样回填的行程（含 seg_id/起止分钟）")
 
 
 # ---- 批次预排 / 确认（同一潮位修订下 2～5 艘船成批处理） ---------------------------
 
 class BatchShipIn(BaseModel):
-    """批次中的一艘船：字段语义与 PlanRequest 的单船字段一致。"""
+    """批次中的一艘船：字段语义与 PlanRequest 的单船字段一致（档案/参数二选一）。"""
     origin: str
     destination: str
     start_minute: int = Field(ge=0, description="规划窗口起点（绝对分钟，>=0）")
     window_minutes: int = Field(gt=0, le=config.MAX_WINDOW, description="窗口长度，<=1440")
-    draft: float = Field(ge=0, description="船舶吃水（米）")
-    height: float = Field(ge=0, description="水面以上高度（米）")
-    margin: float = Field(ge=0, description="安全余量（米）")
+    ship_number: Optional[str] = Field(
+        default=None, description="船号：给定后按该船当前启用版本规划，不得与三项参数混用"
+    )
+    draft: Optional[float] = Field(default=None, ge=0, description="船舶吃水（米，非负）")
+    height: Optional[float] = Field(default=None, ge=0, description="水面以上高度（米，非负）")
+    margin: Optional[float] = Field(default=None, ge=0, description="安全余量（米，非负）")
 
 
 class BatchPlanRequest(BaseModel):
@@ -190,13 +305,16 @@ class BatchPlanRequest(BaseModel):
 class BatchPlanShipOut(PlanResponse):
     index: int = Field(description="批次内序号（0 起，与请求中的优先顺序一致）")
 
-
 class BatchPlanResponse(BaseModel):
     revision: int = Field(description="本次预排实际所据修订号（省略时解析为最新修订）")
     ships: list[BatchPlanShipOut]
 
 
 class BatchShipConfirmIn(BatchShipIn):
+    ship_version: Optional[int] = Field(
+        default=None, ge=1,
+        description="档案模式必填：预排响应回传的档案版本号；参数模式为 null",
+    )
     itinerary: list[LegOut] = Field(description="该船预排结果原样回填（含 seg_id/起止分钟）")
 
 
@@ -216,6 +334,12 @@ class BatchTripOut(BaseModel):
     index: int = Field(description="批次内序号（0 起，与请求顺序一致）")
     trip_id: int
     revision: int
+    ship_number: Optional[str] = Field(
+        default=None, description="档案模式固化的船号；参数模式为 null"
+    )
+    ship_version: Optional[int] = Field(
+        default=None, description="档案模式固化的档案版本号；参数模式为 null"
+    )
     arrival_minute: int
     itinerary: list[LegOut]
 
@@ -239,6 +363,14 @@ class TripOut(BaseModel):
     draft: float
     height: float
     margin: float
+    ship_number: Optional[str] = Field(
+        default=None,
+        description="档案模式确认时固化的船号；参数模式与历史快照为 null",
+    )
+    ship_version: Optional[int] = Field(
+        default=None,
+        description="档案模式确认时固化的档案版本号；参数模式与历史快照为 null",
+    )
     arrival_minute: int
     itinerary: list[LegOut]
     confirmed_at: str
@@ -328,9 +460,15 @@ class TripReviewOut(BaseModel):
     destination: str
     start_minute: int
     window_minutes: int
-    draft: float
+    draft: float = Field(description="快照固化参数；复核/改期只用此值，不回读档案当前版本")
     height: float
     margin: float
+    ship_number: Optional[str] = Field(
+        default=None, description="快照固化的档案引用（船号）；参数模式与历史快照为 null"
+    )
+    ship_version: Optional[int] = Field(
+        default=None, description="快照固化的档案引用（版本号）；参数模式与历史快照为 null"
+    )
     original_arrival_minute: int
     safe: bool = Field(description="原行程在目标修订下按原占用分钟是否安全")
     first_violation: Optional[ViolationOut] = Field(
