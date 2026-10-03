@@ -39,6 +39,26 @@ CREATE TABLE IF NOT EXISTS tide_values (
     PRIMARY KEY (revision, minute)
 );
 
+-- 船舶档案：调度员按唯一船号管理。每次有效变更（吃水/水面以上高度/安全余量/
+-- 启停状态任一实际变化）递增版本号；ship_versions 保存全部历史版本，当前版本
+-- 即各船号的最大版本。档案只增不改——历史版本永不可变，供当前与历史查询。
+CREATE TABLE IF NOT EXISTS ships (
+    ship_no     TEXT PRIMARY KEY,                           -- 唯一船号
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS ship_versions (
+    ship_no     TEXT NOT NULL REFERENCES ships(ship_no),
+    version     INTEGER NOT NULL CHECK (version >= 1),      -- 自 1 起逐次递增
+    draft       REAL NOT NULL CHECK (draft >= 0),           -- 非负吃水（米）
+    height      REAL NOT NULL CHECK (height >= 0),          -- 非负水面以上高度（米）
+    margin      REAL NOT NULL CHECK (margin >= 0),          -- 非负安全余量（米）
+    enabled     INTEGER NOT NULL CHECK (enabled IN (0, 1)), -- 启停状态：1 启用 / 0 停用
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (ship_no, version)
+);
+
 CREATE TABLE IF NOT EXISTS confirmed_trips (
     trip_id         INTEGER PRIMARY KEY AUTOINCREMENT,
     revision        INTEGER NOT NULL,                       -- 确认时所据修订号（快照）
@@ -51,6 +71,8 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     margin          REAL NOT NULL,
     arrival_minute  INTEGER NOT NULL,
     itinerary       TEXT NOT NULL,                          -- JSON 快照
+    ship_no         TEXT,                                   -- 档案引用（可空）：确认时所用船号
+    ship_version    INTEGER,                                -- 档案引用（可空）：确认时所用档案版本
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -129,10 +151,17 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）。"""
+    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
+    为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为 NULL，
+    表示直接提交参数确认、无档案引用）。"""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     if "error" not in cols:
         conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
+    trip_cols = {r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()}
+    if "ship_no" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
+    if "ship_version" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
 
 
 # ---------------------------------------------------------------------------

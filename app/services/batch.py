@@ -20,6 +20,7 @@ from typing import Iterable, Optional
 from ..errors import ApiError
 from .groups import expand_group_occupancy, load_groups
 from .planning import find_itinerary, load_occupancy
+from .ships import resolve_for_confirm, resolve_for_plan
 
 
 def _tag_ship_error(index: int, exc: ApiError) -> ApiError:
@@ -29,15 +30,41 @@ def _tag_ship_error(index: int, exc: ApiError) -> ApiError:
     return ApiError(exc.status_code, exc.code, exc.message, details)
 
 
-def _ship_kwargs(ship) -> dict:
+def _resolve_plan_params(conn, ship) -> dict:
+    """预排时解析一艘船的实际参数：船号 -> 档案当前启用版本；否则直接提交值。"""
+    if ship.ship_no is not None:
+        return resolve_for_plan(conn, ship.ship_no)
+    return {
+        "ship_no": None,
+        "ship_version": None,
+        "draft": ship.draft,
+        "height": ship.height,
+        "margin": ship.margin,
+    }
+
+
+def _resolve_confirm_params(conn, ship) -> dict:
+    """确认时核对一艘船的档案（仍启用且版本未变）并取参数；直接提交参数原样返回。"""
+    if ship.ship_no is not None:
+        return resolve_for_confirm(conn, ship.ship_no, ship.ship_version)
+    return {
+        "ship_no": None,
+        "ship_version": None,
+        "draft": ship.draft,
+        "height": ship.height,
+        "margin": ship.margin,
+    }
+
+
+def _ship_kwargs(ship, params: dict) -> dict:
     return {
         "origin": ship.origin,
         "destination": ship.destination,
         "start_minute": ship.start_minute,
         "window_minutes": ship.window_minutes,
-        "draft": ship.draft,
-        "height": ship.height,
-        "margin": ship.margin,
+        "draft": params["draft"],
+        "height": params["height"],
+        "margin": params["margin"],
     }
 
 
@@ -117,12 +144,16 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
     results = []
     for i, ship in enumerate(ships):
         try:
+            params = _resolve_plan_params(conn, ship)
             result = find_itinerary(
-                conn, **_ship_kwargs(ship), revision=rev, blocked=blocked,
+                conn, **_ship_kwargs(ship, params), revision=rev, blocked=blocked,
             )
         except ApiError as exc:
             raise _tag_ship_error(i, exc)
         _add_itinerary_occupancy(blocked, result["itinerary"], groups)
+        # 按档案预排的船回传船号、版本及所用参数（直接提交参数则为 null）
+        result["ship_no"] = params["ship_no"]
+        result["ship_version"] = params["ship_version"]
         results.append({"index": i, **result})
     return {"revision": rev, "ships": results}
 
@@ -191,10 +222,13 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
     流程（单事务 BEGIN IMMEDIATE）：
       0. 幂等键已存在且内容一致 -> 直接返回原结果（即使修订已更新）；
          内容不一致 -> BATCH_KEY_CONFLICT；
-      1. 修订须仍为最新，否则 REVISION_STALE；
-      2. 读取当时全部已确认占用，逐艘复算：无解 -> PLAN_MISMATCH；
+      1. 按船号提交的船核对档案仍启用且版本未变（SHIP_NOT_FOUND /
+         SHIP_DISABLED / SHIP_VERSION_STALE，附 ship_index，全批回滚）；
+      2. 修订须仍为最新，否则 REVISION_STALE；
+      3. 读取当时全部已确认占用，逐艘复算：无解 -> PLAN_MISMATCH；
          与提交行程逐段不一致 -> PLAN_MISMATCH；前船复算行程并入后船占用；
-      3. 全部通过后一次写入全部快照 + 幂等记录后 COMMIT，任一失败全批回滚。
+      4. 全部通过后一次写入全部快照（固化所用参数与档案引用）+ 幂等记录后
+         COMMIT，任一失败全批回滚。
     """
     key = body.idempotency_key
     digest = content_hash(body)
@@ -219,14 +253,22 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
             replay["replayed"] = True
             return replay, True
 
-        # 1) 修订是否仍为最新
+        # 1) 档案核对：按船号提交的船须仍启用且版本未变（任一失效全批回滚）
+        ship_params: list[dict] = []
+        for i, ship in enumerate(body.ships):
+            try:
+                ship_params.append(_resolve_confirm_params(conn, ship))
+            except ApiError as exc:
+                raise _tag_ship_error(i, exc)
+
+        # 2) 修订是否仍为最新
         latest = conn.execute(
             "SELECT revision FROM tide_revisions ORDER BY revision DESC LIMIT 1"
         ).fetchone()
         if latest is None or latest["revision"] != body.revision:
             raise _stale_error(body.revision, latest["revision"] if latest else None)
 
-        # 2) 当时已确认占用（覆盖全批窗口的并集区间）
+        # 3) 当时已确认占用（覆盖全批窗口的并集区间）
         lo = min(s.start_minute for s in body.ships)
         hi = max(s.start_minute + s.window_minutes - 1 for s in body.ships)
         blocked = load_occupancy(conn, lo, hi)
@@ -234,9 +276,11 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
 
         trip_refs: list[dict] = []
         for i, ship in enumerate(body.ships):
+            params = ship_params[i]
             try:
                 recalculated = find_itinerary(
-                    conn, **_ship_kwargs(ship), revision=body.revision, blocked=blocked,
+                    conn, **_ship_kwargs(ship, params),
+                    revision=body.revision, blocked=blocked,
                 )
             except ApiError as exc:
                 if exc.code == "NO_FEASIBLE_ITINERARY":
@@ -258,21 +302,27 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                     recalculated=recalculated,
                 )
 
-            # 3a) 先保存该船不可变快照（同一事务，失败整体回滚）
+            # 4a) 先保存该船不可变快照（同一事务，失败整体回滚）；
+            #     快照固化所用参数与档案引用（船号 + 版本，无档案则为 NULL）
             cur = conn.execute(
                 "INSERT INTO confirmed_trips"
                 " (revision, origin, destination, start_minute, window_minutes,"
-                "  draft, height, margin, arrival_minute, itinerary)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  draft, height, margin, arrival_minute, itinerary,"
+                "  ship_no, ship_version)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (body.revision, ship.origin, ship.destination, ship.start_minute,
-                 ship.window_minutes, ship.draft, ship.height, ship.margin,
+                 ship.window_minutes, params["draft"], params["height"],
+                 params["margin"],
                  recalculated["arrival_minute"],
-                 json.dumps(recalculated["itinerary"])),
+                 json.dumps(recalculated["itinerary"]),
+                 params["ship_no"], params["ship_version"]),
             )
             trip_refs.append({
                 "index": i,
                 "trip_id": cur.lastrowid,
                 "revision": body.revision,
+                "ship_no": params["ship_no"],
+                "ship_version": params["ship_version"],
                 "arrival_minute": recalculated["arrival_minute"],
                 "itinerary": recalculated["itinerary"],
             })

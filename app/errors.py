@@ -41,3 +41,8 @@ def no_itinerary(origin: str, destination: str) -> ApiError:
         f"在给定窗口内不存在从 {origin} 到 {destination} 的可行行程",
         {"origin": origin, "destination": destination},
     )
+
+
+def ship_not_found(ship_no: str) -> ApiError:
+    return ApiError(404, "SHIP_NOT_FOUND", f"未知船号: {ship_no}",
+                    {"ship_no": ship_no})

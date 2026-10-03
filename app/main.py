@@ -26,6 +26,11 @@ from .schemas import (
     RevisionOut,
     SegmentIn,
     SegmentOut,
+    ShipCreateRequest,
+    ShipOut,
+    ShipUpdateRequest,
+    ShipUpdateResponse,
+    ShipVersionOut,
     TravelControlListOut,
     TravelControlOut,
     TravelControlReplaceRequest,
@@ -42,6 +47,16 @@ from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
+from .services.ships import (
+    create_ship,
+    get_ship,
+    get_version,
+    list_ships,
+    list_versions,
+    resolve_for_confirm,
+    resolve_for_plan,
+    update_ship,
+)
 from .services.voids import get_void_record, void_trip
 
 
@@ -81,10 +96,29 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
             "error": {
                 "code": "VALIDATION_ERROR",
                 "message": "请求参数校验失败",
-                "details": {"errors": exc.errors()},
+                "details": {"errors": _safe_validation_errors(exc)},
             }
         },
     )
+
+
+def _safe_validation_errors(exc: RequestValidationError) -> list:
+    """Pydantic 错误清单的可 JSON 化形式。
+
+    模型级校验（如船号与三项参数互斥）抛出的 ValueError 会出现在 ctx 中，
+    不可 JSON 序列化，此处转为字符串；其余可序列化的约束上下文原样保留。
+    """
+    safe = []
+    for err in exc.errors():
+        err = dict(err)
+        ctx = err.get("ctx")
+        if ctx:
+            err["ctx"] = {
+                k: (str(v) if isinstance(v, Exception) else v)
+                for k, v in ctx.items()
+            }
+        safe.append(err)
+    return safe
 
 
 @app.get("/health")
@@ -224,6 +258,65 @@ def get_channel_group(group_id: int):
     """读取指定狭窄水道组的组号及成员。未知组 404 CHANNEL_GROUP_NOT_FOUND。"""
     with get_conn() as conn:
         return get_group(conn, group_id)
+
+
+# ---- 船舶档案 -------------------------------------------------------------------
+
+@app.post("/api/ships", status_code=201, response_model=ShipOut, tags=["ships"])
+def create_ship_archive(body: ShipCreateRequest):
+    """建立船舶档案：唯一船号 + 非负吃水/水面以上高度/安全余量 + 启停状态。
+
+    初始版本为 1；重复船号 409 SHIP_EXISTS，非法参数 422 VALIDATION_ERROR，
+    失败不留半成品。
+    """
+    with get_conn() as conn:
+        return create_ship(conn, body.ship_no, body.draft, body.height,
+                           body.margin, body.enabled, body.note)
+
+
+@app.get("/api/ships", response_model=list[ShipOut], tags=["ships"])
+def list_ship_archives():
+    """列出全部船舶档案的当前版本（按船号升序）。"""
+    with get_conn() as conn:
+        return list_ships(conn)
+
+
+@app.get("/api/ships/{ship_no}", response_model=ShipOut, tags=["ships"])
+def get_ship_archive(ship_no: str):
+    """读取指定船号的当前版本。未知船号 404 SHIP_NOT_FOUND。"""
+    with get_conn() as conn:
+        return get_ship(conn, ship_no)
+
+
+@app.put("/api/ships/{ship_no}", response_model=ShipUpdateResponse, tags=["ships"])
+def update_ship_archive(ship_no: str, body: ShipUpdateRequest):
+    """变更船舶档案：未给出的字段沿用当前值。
+
+    吃水/水面以上高度/安全余量/启停状态任一实际变化 -> 版本 +1
+    （changed=true）；与当前完全一致（含空提交）-> 版本不变（changed=false）。
+    历史版本不可变、可随时查询。未知船号 404 SHIP_NOT_FOUND。
+    """
+    with get_conn() as conn:
+        state, changed = update_ship(conn, ship_no, body.draft, body.height,
+                                     body.margin, body.enabled, body.note)
+    return ShipUpdateResponse(**state, changed=changed)
+
+
+@app.get("/api/ships/{ship_no}/versions",
+         response_model=list[ShipVersionOut], tags=["ships"])
+def list_ship_versions(ship_no: str):
+    """列出指定船号的全部历史版本（按版本号升序）。未知船号 404。"""
+    with get_conn() as conn:
+        return list_versions(conn, ship_no)
+
+
+@app.get("/api/ships/{ship_no}/versions/{version}",
+         response_model=ShipVersionOut, tags=["ships"])
+def get_ship_version(ship_no: str, version: int):
+    """读取指定船号的某一历史版本。未知船号 SHIP_NOT_FOUND、未知版本
+    SHIP_VERSION_NOT_FOUND。"""
+    with get_conn() as conn:
+        return get_version(conn, ship_no, version)
 
 
 # ---- 潮位修订 --------------------------------------------------------------------
@@ -408,7 +501,20 @@ def _resolve_base_revision(conn, base_revision: Optional[int]) -> int:
 
 @app.post("/api/trips/plan", response_model=PlanResponse, tags=["trips"])
 def plan_trip(body: PlanRequest):
+    """规划最早抵达行程（只读，不占位）。
+
+    船舶参数两种输入二选一（混用拒绝）：直接提交 draft/height/margin，或
+    提交 ship_no 按档案**当前启用版本**的参数规划（档案停用 409
+    SHIP_DISABLED、未知船号 404 SHIP_NOT_FOUND）；响应回传实际所用参数，
+    按档案规划时另回传船号与版本。
+    """
     with get_conn() as conn:
+        if body.ship_no is not None:
+            params = resolve_for_plan(conn, body.ship_no)
+        else:
+            params = {"ship_no": None, "ship_version": None,
+                      "draft": body.draft, "height": body.height,
+                      "margin": body.margin}
         blocked = load_occupancy(
             conn, body.start_minute,
             body.start_minute + body.window_minutes - 1,
@@ -419,25 +525,40 @@ def plan_trip(body: PlanRequest):
             destination=body.destination,
             start_minute=body.start_minute,
             window_minutes=body.window_minutes,
-            draft=body.draft,
-            height=body.height,
-            margin=body.margin,
+            draft=params["draft"],
+            height=params["height"],
+            margin=params["margin"],
             revision=body.revision,
             blocked=blocked,
         )
+        result["ship_no"] = params["ship_no"]
+        result["ship_version"] = params["ship_version"]
     return result
 
 
 @app.post("/api/trips/confirm", status_code=201, response_model=TripOut, tags=["trips"])
 def confirm_trip(body: ConfirmRequest):
     """确认行程：必须携带所据修订号；同一事务内以最新潮位修订与当时占用
-    重新计算，过期/不一致即冲突且不保存。"""
+    重新计算，过期/不一致即冲突且不保存。
+
+    按船号确认时须回填规划所得 ship_no 与 ship_version：事务内先核对档案
+    仍启用且版本未变（停用 SHIP_DISABLED、版本已变 SHIP_VERSION_STALE、
+    未知船号 SHIP_NOT_FOUND），再复算；快照固化所用参数与档案引用。
+    """
     if body.revision is None:
         raise ApiError(422, "VALIDATION_ERROR", "确认行程必须携带所据潮位修订号 revision")
 
     with get_conn() as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
+
+            # 0) 档案核对（按船号确认时）：仍启用且版本未变，取档案当前参数
+            if body.ship_no is not None:
+                params = resolve_for_confirm(conn, body.ship_no, body.ship_version)
+            else:
+                params = {"ship_no": None, "ship_version": None,
+                          "draft": body.draft, "height": body.height,
+                          "margin": body.margin}
 
             # 1) 修订是否仍为最新（过期则冲突）
             latest = conn.execute(
@@ -465,9 +586,9 @@ def confirm_trip(body: ConfirmRequest):
                     destination=body.destination,
                     start_minute=body.start_minute,
                     window_minutes=body.window_minutes,
-                    draft=body.draft,
-                    height=body.height,
-                    margin=body.margin,
+                    draft=params["draft"],
+                    height=params["height"],
+                    margin=params["margin"],
                     revision=body.revision,
                     blocked=blocked,
                 )
@@ -504,14 +625,18 @@ def confirm_trip(body: ConfirmRequest):
                 )
 
             # 4) 复核通过：按"当时结果"保存不可变快照
+            #    （固化所用参数与档案引用，后续档案变更不改写历史）
             cur = conn.execute(
                 "INSERT INTO confirmed_trips"
                 " (revision, origin, destination, start_minute, window_minutes,"
-                "  draft, height, margin, arrival_minute, itinerary)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  draft, height, margin, arrival_minute, itinerary,"
+                "  ship_no, ship_version)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (body.revision, body.origin, body.destination, body.start_minute,
-                 body.window_minutes, body.draft, body.height, body.margin,
-                 recalculated["arrival_minute"], json.dumps(recalculated["itinerary"])),
+                 body.window_minutes, params["draft"], params["height"],
+                 params["margin"],
+                 recalculated["arrival_minute"], json.dumps(recalculated["itinerary"]),
+                 params["ship_no"], params["ship_version"]),
             )
             trip_id = cur.lastrowid
             row = conn.execute(
@@ -544,7 +669,8 @@ def plan_trip_batch(body: BatchPlanRequest):
     按 ships 给出的优先顺序逐艘沿用单船最早抵达 + 同刻航段序列字典序
     择优；后船同时避开全部已确认占用与本批前船的拟占用。任一船无解
     （或未知节点/缺潮位）时，错误 details 给出首个失败序号 ship_index
-    （0 起）。revision 省略时整批采用最新修订。
+    （0 起）。revision 省略时整批采用最新修订。每艘船可用 ship_no 代替
+    三项参数（按档案当前启用版本，混用拒绝），结果回传船号、版本及所用参数。
     """
     with get_conn() as conn:
         result = plan_batch(conn, body.ships, body.revision)
@@ -555,14 +681,16 @@ def plan_trip_batch(body: BatchPlanRequest):
           status_code=201, response_model=BatchConfirmResponse,
           tags=["trips", "batch"])
 def confirm_trip_batch(body: BatchConfirmRequest):
-    """批次确认：单事务内核订最新修订与当时占用，逐艘复算并逐段比对。
+    """批次确认：单事务内核订档案、最新修订与当时占用，逐艘复算并逐段比对。
 
+    - 按船号提交的船：档案停用 409 SHIP_DISABLED、版本已变 409
+      SHIP_VERSION_STALE、未知船号 404 SHIP_NOT_FOUND（均附 ship_index）；
     - 修订过期 -> 409 REVISION_STALE；
     - 任一船无解或与提交行程不一致 -> 409 PLAN_MISMATCH（details.ship_index
       指出首个失败序号），全批不保存；
-    - 全部通过则一次写入全部不可变快照并登记幂等键；同键同内容重试返回
-      原结果（200，replayed=true，即使修订已更新）；同键异内容
-      409 BATCH_KEY_CONFLICT。
+    - 全部通过则一次写入全部不可变快照（固化所用参数与档案引用）并登记
+      幂等键；同键同内容重试返回原结果（200，replayed=true，即使修订已
+      更新）；同键异内容 409 BATCH_KEY_CONFLICT。
     """
     with get_conn() as conn:
         result, replayed = confirm_batch(conn, body)
@@ -668,6 +796,9 @@ def _trip_out(d: dict) -> TripOut:
         draft=d["draft"],
         height=d["height"],
         margin=d["margin"],
+        # 确认时固化的档案引用（无档案引用为 null）；后续档案变更不改写快照
+        ship_no=d.get("ship_no"),
+        ship_version=d.get("ship_version"),
         arrival_minute=d["arrival_minute"],
         itinerary=json.loads(d["itinerary"]),
         confirmed_at=d["confirmed_at"],
